@@ -1,40 +1,16 @@
-# pyre-ignore-all-errors
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import pandas as pd
 from prophet.serialize import model_from_json
 from sqlalchemy import create_engine, text
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any
 import json
 import os
+import numpy as np
 import requests
-import re
 import math
 import scipy.stats as st
-import httpx
-
-# --- NEW IMPORTS FOR LANGCHAIN AND RAG ---
-from langchain_core.tools import tool
-from langchain_openai import ChatOpenAI
-from dotenv import load_dotenv
-load_dotenv(override=True)
-from langgraph.prebuilt import create_react_agent
-from langchain_core.prompts import ChatPromptTemplate
-import chromadb
-from sentence_transformers import SentenceTransformer
-
-# Initialize ChromaDB Client
-CHROMA_DB_DIR = "./chroma_db"
-try:
-    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
-    knowledge_collection = chroma_client.get_collection("supply_chain_knowledge")
-    embedder = SentenceTransformer("all-MiniLM-L6-v2")
-    print("✅ Connected to local ChromaDB knowledge base.")
-except Exception as e:
-    knowledge_collection = None
-    embedder = None
-    print(f"⚠️ Could not load ChromaDB: {e}")
 
 app = FastAPI(title="Sales & Inventory Decision System")
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -138,7 +114,7 @@ class PredictionRequest(BaseModel):
     family: str
     months: int = 3
     simulate_promo: bool = False
-    custom_oil_price: Optional[float] = None
+    custom_oil_price: float = None
 
 class InventoryRequest(BaseModel):
     store_id: int
@@ -209,15 +185,14 @@ def predict_inventory_advanced(req: InventoryRequest):
     m, metrics, exists = load_model(req.store_id, req.family)
     if not exists:
         raise HTTPException(status_code=404, detail="Model not found")
-    assert m is not None
 
     # 1. Predict for the lead time window
     future = m.make_future_dataframe(periods=req.lead_time_days)
     future['onpromotion'] = 0 
-    future['oil_price'] = m.history['oil_price'].iloc[-1] if 'oil_price' in m.history.columns else 90.0
+    future['oil_price'] = m.history['oil_price'].iloc[-1] if 'oil_price' in m.history else 90.0
     
     future['onpromotion'] = future['onpromotion'].fillna(0)
-    future['oil_price'] = future['oil_price'].ffill().bfill()
+    future['oil_price'] = future['oil_price'].fillna(method='ffill').fillna(method='bfill')
 
     forecast = m.predict(future)
     future_data = forecast.tail(req.lead_time_days)
@@ -235,7 +210,7 @@ def predict_inventory_advanced(req: InventoryRequest):
         stockout_prob = 1.0 - st.norm.cdf(z_score)
 
     # 4. Financial Optimization (EOQ)
-    annualized_demand = (expected_demand / req.lead_time_days) * 365 if req.lead_time_days > 0 else 0
+    annualized_demand = (expected_demand / req.lead_time_days) * 365 
     if annualized_demand > 0:
         optimal_order_qty = math.sqrt((2 * annualized_demand * req.order_cost) / (req.holding_cost * req.unit_price))
     else:
@@ -258,8 +233,6 @@ def predict_inventory_advanced(req: InventoryRequest):
         status = "WARNING (Reorder Soon)"
     elif spoilage_risk > 0:
         status = "OVERSTOCKED (Spoilage Risk Active)"
-
-    stakeholders = STAKEHOLDER_DB.get(req.family, DEFAULT_STAKEHOLDERS)
 
     return {
         "decision": {
@@ -286,9 +259,9 @@ def get_market_sentiment(m, periods=30):
     # 1. Generate Forecast
     future = m.make_future_dataframe(periods=periods)
     future['onpromotion'] = 0
-    future['oil_price'] = m.history['oil_price'].iloc[-1] if 'oil_price' in m.history.columns else 90.0
+    future['oil_price'] = m.history['oil_price'].iloc[-1] if 'oil_price' in m.history else 90.0
     future['onpromotion'] = future['onpromotion'].fillna(0)
-    future['oil_price'] = future['oil_price'].ffill().bfill()
+    future['oil_price'] = future['oil_price'].fillna(method='ffill').fillna(method='bfill')
     
     forecast = m.predict(future)
     
@@ -302,7 +275,7 @@ def get_market_sentiment(m, periods=30):
     # (In a real DB scenario, we'd query history. Here we use the trend component)
     current_trend = forecast['trend'].iloc[-1]
     start_trend = forecast['trend'].iloc[-periods]
-    trend_diff: float = ((current_trend - start_trend) / start_trend) * 100 if start_trend != 0 else 0.0
+    trend_diff = ((current_trend - start_trend) / start_trend) * 100
     
     trend_direction = "Stable ➡️"
     if trend_diff > 2: trend_direction = "Growing 📈"
@@ -312,7 +285,7 @@ def get_market_sentiment(m, periods=30):
     # Width of the confidence interval
     avg_width = (forecast.tail(periods)['yhat_upper'] - forecast.tail(periods)['yhat_lower']).mean()
     avg_pred = forecast.tail(periods)['yhat'].mean()
-    risk_score = (avg_width / avg_pred) * 100 if avg_pred != 0 else 0.0
+    risk_score = (avg_width / avg_pred) * 100
     
     risk_level = "Low"
     if risk_score > 20: risk_level = "Medium"
@@ -332,7 +305,7 @@ def get_market_sentiment(m, periods=30):
     return {
         "next_7_total": int(next_7_days),
         "next_30_total": int(next_30_days),
-        "trend_pct": round(float(trend_diff), 1),
+        "trend_pct": round(trend_diff, 1),
         "trend_desc": trend_direction,
         "risk_level": risk_level,
         "peak_day": peak_date
@@ -371,7 +344,6 @@ def predict_sales(req: PredictionRequest):
     m, metrics, exists = load_model(req.store_id, req.family)
     if not exists:
         raise HTTPException(status_code=404, detail=f"Model not found for Store {req.store_id} - {req.family}")
-    assert m is not None
 
     # 1. Setup Future Dataframe
     future = m.make_future_dataframe(periods=req.months * 30)
@@ -392,13 +364,13 @@ def predict_sales(req: PredictionRequest):
         artificial_impact = price_change * -5 
     else:
         last_known_oil = 90.0
-        if 'oil_price' in m.history.columns:
+        if 'oil_price' in m.history:
              last_known_oil = m.history['oil_price'].iloc[-1]
         future.loc[future_dates, 'oil_price'] = last_known_oil
 
     # Fill NaNs
     future['onpromotion'] = future['onpromotion'].fillna(0)
-    future['oil_price'] = future['oil_price'].ffill().bfill()
+    future['oil_price'] = future['oil_price'].fillna(method='ffill').fillna(method='bfill')
 
     # 3. Predict
     forecast = m.predict(future)
@@ -440,14 +412,11 @@ def predict_inventory(req: InventoryRequest):
     m, metrics, exists = load_model(req.store_id, req.family)
     if not exists:
         raise HTTPException(status_code=404, detail="Model not found")
-    assert m is not None
 
     # 1. Predict for the lead time window
     future = m.make_future_dataframe(periods=req.lead_time_days)
     future['onpromotion'] = 0
-    future['oil_price'] = m.history['oil_price'].iloc[-1] if 'oil_price' in m.history.columns else 90.0
-    future['onpromotion'] = future['onpromotion'].fillna(0)
-    future['oil_price'] = future['oil_price'].ffill().bfill()
+    future['oil_price'] = m.history['oil_price'].iloc[-1] if 'oil_price' in m.history else 90.0
     forecast = m.predict(future)
     future_data = forecast.tail(req.lead_time_days)
 
@@ -467,7 +436,7 @@ def predict_inventory(req: InventoryRequest):
 
     # 4. Financial Optimization (EOQ)
     # Convert lead time demand to an annualized rate for the formula
-    annualized_demand = (expected_demand / req.lead_time_days) * 365 if req.lead_time_days > 0 else 0
+    annualized_demand = (expected_demand / req.lead_time_days) * 365
 
     if annualized_demand > 0:
         optimal_order_qty = math.sqrt((2 * annualized_demand * req.order_cost) / (req.holding_cost * req.unit_price))
@@ -518,22 +487,14 @@ def analyze_history(req: InventoryRequest): # Reusing InventoryRequest for simpl
     m, _, exists = load_model(req.store_id, req.family)
     if not exists:
         raise HTTPException(status_code=404, detail="Model not found")
-    assert m is not None
 
     # 1. Predict on History
     # Prophet stores history in m.history. We just need to predict on it to get the confidence bands.
-    if 'oil_price' not in m.history.columns:
-        m.history['oil_price'] = 90.0
-    if 'onpromotion' not in m.history.columns:
-        m.history['onpromotion'] = 0
     forecast = m.predict(m.history)
     
     # 2. Find Outliers
     # Compare 'y' (actual) with 'yhat_upper' and 'yhat_lower'
-    history_df = m.history[['ds', 'y']].set_index('ds')
-    forecast = forecast.set_index('ds')
-    forecast['y'] = history_df['y']
-    forecast = forecast.reset_index()
+    forecast['y'] = m.history['y'].reset_index(drop=True)
     
     last_historical_date = m.history['ds'].max()
     time_offset = pd.Timestamp.now().normalize() - last_historical_date
@@ -563,155 +524,100 @@ def analyze_history(req: InventoryRequest): # Reusing InventoryRequest for simpl
     
     return {
         "anomaly_count": len(anomalies),
-        "recent_anomalies": anomalies[:10]  # Top 10 most recent
+        "recent_anomalies": anomalies[:10] # Top 10 most recent
     }
 
-# --- AGENT TOOLBOX (LangChain Tools) ---
-
-@tool
-def get_sales_forecast(store_id: int, family: str, days_ahead: int = 30) -> str:
-    """Gets the statistical Prophet forecast math for a specific store and product family.
-    Returns the expected total volume, risk level, and trend."""
-    try:
-        m, metrics, exists = load_model(store_id, family)
-        if not exists:
-            return f"Error: No forecast model found for Store {store_id}, Family {family}."
-        assert m is not None
-        
-        sentiment = get_market_sentiment(m, periods=days_ahead)
-        return (
-            f"FORECAST FOR {family}: "
-            f"Expected {days_ahead}-day volume: {sentiment['next_30_total']}. "
-            f"Trend: {sentiment['trend_pct']}% ({sentiment['trend_desc']}). "
-            f"Risk Level: {sentiment['risk_level']}. Peak day expected: {sentiment['peak_day']}."
-        )
-    except Exception as e:
-        return f"Error computing forecast: {str(e)}"
-
-@tool
-def search_company_knowledge(query: str) -> str:
-    """Searches the company's unstructured internal documents (emails, briefs, news) for context.
-    Use this to find out WHY demand might be changing (e.g., marketing campaigns, strikes, supplier delays)."""
-    if not knowledge_collection or not embedder:
-        return "Error: Internal knowledge vector database is offline."
-    
-    try:
-        query_embedding = embedder.encode(query).tolist()
-        results = knowledge_collection.query(
-            query_embeddings=[query_embedding],
-            n_results=2
-        )
-        
-        if not results['documents'][0]:
-            return "No relevant internal documents found."
-            
-        docs = results['documents'][0]
-        return "Found the following internal context:\n" + "\n---\n".join(docs)
-    except Exception as e:
-        return f"Database error: {str(e)}"
-
-@tool
-def check_inventory_advanced(store_id: int, family: str, current_stock: int) -> str:
-    """Checks inventory using probabilistic math (stockout risk) and calculates Economic Order Quantity (EOQ)."""
-    try:
-        req = InventoryRequest(store_id=store_id, family=family, current_stock=current_stock)
-        data = predict_inventory_advanced(req)
-        
-        return json.dumps({
-            "status": data["decision"]["status"],
-            "stockout_probability_pct": data["decision"]["stockout_probability_pct"],
-            "suggested_order_qty": data["decision"]["suggested_order_qty"]
-        })
-    except Exception as e:
-        return f"Inventory math error: {str(e)}"
-
-@tool
-def draft_purchase_order(family: str, quantity: int) -> str:
-    """Triggers the UI to display a draft purchase order widget to the user."""
-    # This returns the JSON trigger format to show the visual PO button on the frontend.
-    estimated_cost = float(quantity) * 15.5
-    
-    # Actually write the draft order into the database
-    try:
-        with engine.connect() as connection:
-            # Check if table exists, if not create a simple one
-            connection.execute(text("""
-                CREATE TABLE IF NOT EXISTS purchase_orders (
-                    id SERIAL PRIMARY KEY,
-                    family VARCHAR(255),
-                    quantity INTEGER,
-                    estimated_cost FLOAT,
-                    status VARCHAR(50),
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """))
-            
-            # Insert the draft order
-            connection.execute(text("""
-                INSERT INTO purchase_orders (family, quantity, estimated_cost, status)
-                VALUES (:family, :quantity, :cost, 'DRAFT')
-            """), {"family": family.upper(), "quantity": quantity, "cost": estimated_cost})
-            
-            connection.commit()
-            print(f"✅ Draft PO saved to database for {quantity} units of {family}.")
-    except Exception as e:
-        print(f"⚠️ Failed to save PO to database: {e}")
-
-    return json.dumps({
-        "WIDGET_TRIGGER": "purchase_order",
-        "family": family.upper(),
-        "suggested_qty": quantity,
-        "estimated_cost": estimated_cost,
-        "supplier": "Standard General Distributors"
-    })
-
-# The tools list for LangChain
-# Wrap the helper functions with @tool for the agent
-execute_text_to_sql_tool = tool(execute_text_to_sql)
-get_live_market_data_tool = tool(get_live_market_data)
-
-langchain_tools = [
-    get_sales_forecast,
-    search_company_knowledge,
-    check_inventory_advanced,
-    draft_purchase_order,
-    execute_text_to_sql_tool,
-    get_live_market_data_tool
+# --- AGENT TOOLBOX: Functions the LLM can invoke ---
+supply_chain_tools = [
+    {
+        "type": "function",
+        "function": {
+            "name": "check_inventory",
+            "description": "Checks current stock levels and alerts if stock is low.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "family": {"type": "string", "description": "The product family"}
+                },
+                "required": ["family"]
+            }
+        }
+    },
+    {
+            "type": "function",
+            "function": {
+                "name": "draft_purchase_order",
+                "description": "Generates a purchase order widget. You MUST extract the product category from the user's message and format it EXACTLY as one of these uppercase strings: GROCERY I, BEVERAGES, PRODUCE, CLEANING, DAIRY, BREAD/BAKERY.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "family": {
+                            "type": "string", 
+                            "description": "The EXACT uppercase product family (e.g., BEVERAGES, CLEANING). Do not use lowercase."
+                        },
+                        "suggested_qty": {
+                            "type": "integer", 
+                            "description": "Amount to order. If the user doesn't specify an exact amount, invent a reasonable default like 50."
+                        }
+                    },
+                    "required": ["family", "suggested_qty"]
+                }
+            }
+        },
+    {
+        "type": "function",
+        "function": {
+            "name": "ask_database",
+            "description": "Queries the PostgreSQL database. USE ONLY FOR HISTORICAL PAST DATA. Note: The database data ends in 2017. If the user asks for 'yesterday' or 'recent' sales, pass that intent directly in your question so the database queries the absolute latest available records.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "question": {"type": "string", "description": "The exact question about PAST data."}
+                },
+                "required": ["question"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "check_market_conditions",
+            "description": "Fetches live, real-world API data about weather disruptions, shipping delays, or commodity prices (like oil).",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to search for, e.g., 'oil prices' or 'port weather'"}
+                },
+                "required": ["query"]
+            }
+        }
+    }
 ]
-
 @app.post("/dashboard/summary")
 def get_dashboard_summary(req: PredictionRequest):
     # We use PredictionRequest since it already has store_id and family
     m, metrics, exists = load_model(req.store_id, req.family)
     if not exists:
         raise HTTPException(status_code=404, detail="Model not found")
-    assert m is not None
 
     # 1. Get Market Sentiment (Forecast totals and trends)
     sentiment = get_market_sentiment(m, periods=30)
 
     # 2. Get Recent Anomalies
-    if 'oil_price' not in m.history.columns:
-        m.history['oil_price'] = 90.0
-    if 'onpromotion' not in m.history.columns:
-        m.history['onpromotion'] = 0
     forecast = m.predict(m.history)
-    history_df = m.history[['ds', 'y']].set_index('ds')
-    forecast = forecast.set_index('ds')
-    forecast['y'] = history_df['y']
-    forecast = forecast.reset_index()
+    forecast['y'] = m.history['y'].reset_index(drop=True)
     
-    anomaly_count: int = 0
-    high_severity_count: int = 0
+    anomaly_count = 0
+    high_severity_count = 0
     for idx, row in forecast.tail(60).iterrows(): # Look at the last 60 days of history
-        actual: float = float(row['y'])
-        upper: float = float(row['yhat_upper'])
-        lower: float = float(row['yhat_lower'])
+        actual = row['y']
+        upper = row['yhat_upper']
+        lower = row['yhat_lower']
         
         if actual > upper or actual < lower:
-            anomaly_count = anomaly_count + 1
+            anomaly_count += 1
             if actual > upper * 1.2 or actual < lower * 0.8:
-                high_severity_count = high_severity_count + 1
+                high_severity_count += 1
 
     # 3. Format data specifically for the React StatCards
     return {
@@ -724,13 +630,13 @@ def get_dashboard_summary(req: PredictionRequest):
             },
             {
                 "title": "Market Trend",
-                "value": str(sentiment['trend_desc']).replace(" 📈", "").replace(" 📉", "").replace(" ➡️", ""),
+                "value": sentiment['trend_desc'].replace(" 📈", "").replace(" 📉", "").replace(" ➡️", ""),
                 "trend": sentiment['trend_pct'], # Neutral indicator
                 "trend_label": "Based on moving average"
             },
             {
                 "title": "Forecast Risk Level",
-                "value": str(sentiment['risk_level']).upper(),
+                "value": sentiment['risk_level'].upper(),
                 "status_color": "red" if sentiment['risk_level'] == "High" else ("yellow" if sentiment['risk_level'] == "Medium" else "green"),
                 "trend_label": "Based on confidence intervals"
             },
@@ -762,171 +668,307 @@ def get_available_categories(store_id: int = 1):
 
 @app.post("/chat")
 def chat_with_multi_agent_system(req: ChatRequest):
-    """
-    Overhauled Chat Endpoint using LangChain and Llama3.1.
-    """
-    
-    # 1. Initialize the LLM
-    try:
-        def log_rate_limits(response):
-            rem = response.headers.get("x-ratelimit-remaining")
-            reset = response.headers.get("x-ratelimit-reset")
-            if rem is not None:
-                print(f"📊 Rate Limits -> x-ratelimit-remaining: {rem} | x-ratelimit-reset: {reset}")
-
-        http_client = httpx.Client(event_hooks={'response': [log_rate_limits]})
-
-        # Using GitHub Models API
-        llm = ChatOpenAI(
-            model="gpt-4o-mini", 
-            temperature=0,
-            api_key=os.environ.get("GITHUB_TOKEN"),
-            base_url="https://models.inference.ai.azure.com",
-            http_client=http_client
+    # 1. Load Context (Prophet Model)
+    m, _, exists = load_model(req.store_id, req.family)
+    forecast_context = ""
+    if exists:
+        stats = get_market_sentiment(m)
+        forecast_context = (
+            f"FORECAST DATA for {req.family}: "
+            f"Next 7-day demand is {stats['next_7_total']}. Trend: {stats['trend_desc']}."
         )
-    except Exception as e:
-        return {"type": "message", "content": f"Failed to connect to API: {str(e)}"}
 
-    # 2. Build the System Prompt
-    system_content = (
-        "You are a highly capable AI Supply Chain Executive combining mathematical forecasting with business intelligence.\n\n"
-        "CORE RULES:\n"
-        "1. You have tools to check mathematical forecasts, search internal emails, check inventory, and draft orders.\n"
-        "2. USE YOUR TOOLS. If someone asks about 'Beverages', you MUST use `get_sales_forecast` AND `search_company_knowledge` to get both the math and the human context before answering.\n"
-        "3. If the user asks you to order or restock, check inventory first using `check_inventory_advanced`, then use `draft_purchase_order` with the suggested quantity.\n"
-        "4. Provide concise, executive-level summaries combining the data sources in natural language.\n"
-        "5. CRITICAL: NEVER output raw JSON tool calls or parameters in your final response to the user. Always summarize the actions you took naturally (e.g., 'I checked the inventory and drafted an order').\n\n"
-        f"Note: The active parameters are Store {req.store_id}, Family '{req.family}', and current physical stock is {req.current_stock}."
+    # ---------------------------------------------------------
+    # AGENT 1: THE ORCHESTRATOR (ROUTER)
+    # ---------------------------------------------------------
+    router_prompt = (
+        "You are the Orchestrator. Read the user's message and route it to the correct specialist.\n"
+        "Reply EXACTLY with one of these four words: ANALYST, EXECUTIVE, RISK, or GENERAL.\n"
+        "- Use ANALYST if the user asks about forecasts, past sales, trends, or the database.\n"
+        "- Use EXECUTIVE if the user asks to check inventory, current stock, stock levels, or draft an order.\n"
+        "- Use RISK if the user asks about weather, oil prices, storms, shipping delays, or outside news.\n"
+        "- Use GENERAL if it is a standard greeting."
     )
-
-    messages = []
-    for msg in req.history[-4:]:
-        role = "assistant" if msg.get("sender") == "assistant" else "user"
-        messages.append((role, msg.get("content", "")))
-    messages.append(("user", req.message))
-
-    # 3. Create the LangGraph Agent
-    agent_executor = create_react_agent(llm, tools=langchain_tools, prompt=system_content)
-
-    # 4. Execute standard user turn
+    
     try:
-        print(f"🤖 User query: {req.message}")
-        result = agent_executor.invoke({"messages": messages})
-        
-        # 5. Extract thoughts and widgets from intermediate messages
-        agent_thoughts = []
-        raw_output = result["messages"][-1].content
-        if not isinstance(raw_output, str):
-            raw_output = str(raw_output)
-            
-        final_type = "message"
-        widget_data = None
-        
-        # Extract from LangGraph intermediate steps
-        for msg in result["messages"]:
-            # Capture tool calls for thoughts
-            if hasattr(msg, 'tool_calls') and msg.tool_calls:
-                for tc in msg.tool_calls:
-                    agent_thoughts.append({
-                        "tool": tc.get("name", "tool"),
-                        "args": tc.get("args", {})
+        routing_response = requests.post(
+            "http://localhost:11434/api/chat",
+            json={
+                "model": "llama3.1",
+                "messages": [
+                    {"role": "system", "content": router_prompt},
+                    {"role": "user", "content": req.message}
+                ],
+                "stream": False
+            }
+        ).json()
+        selected_agent = routing_response.get("message", {}).get("content", "").strip().upper()
+    except Exception as e:
+        return {"type": "message", "content": "Orchestrator offline. System error."}
+
+    if selected_agent not in ["ANALYST", "EXECUTIVE", "GENERAL"]:
+        selected_agent = "GENERAL"
+
+    print(f"🧠 Orchestrator routed task to: {selected_agent}")
+
+    # ---------------------------------------------------------
+    # AGENT EXECUTION (ROUTING LOGIC)
+    # ---------------------------------------------------------
+    agent_thoughts = [{"tool": f"Orchestrator routed to {selected_agent}", "args": {}}]
+    
+    if selected_agent == "ANALYST":
+        system_msg = (
+            "You are the Quantitative Analyst.\n"
+            f"Here is the data you already know: {forecast_context}\n"
+            "CRITICAL RULES:\n"
+            "1. IF THE USER ASKS ABOUT THE FUTURE (forecasts, next X days): DO NOT trigger any tools. Answer directly using the text provided above. If they ask for 4 days, take the 7-day total, divide by 7, and multiply by 4. Just do the math and reply in plain text.\n"
+            "2. IF THE USER ASKS ABOUT THE PAST: Only then should you trigger the `ask_database` tool.\n"
+            "3. 'GROCERY I' is the full product name. Never ask for sub-categories.\n"
+            "4. NEVER output raw JSON in your text."
+        )
+        tools_to_use = supply_chain_tools
+    
+    elif selected_agent == "EXECUTIVE":
+        system_msg = (
+            f"You are the Operations Executive managing the {req.family} category. "
+            f"CRITICAL RULES: "
+            f"1. NEVER invent, guess, or hallucinate inventory levels, item names (like bread or milk), or quantities. Do not list individual grocery items. We only track bulk categories like {req.family}. "
+            f"2. ALWAYS use the `check_inventory` tool to get the real mathematical data before answering inventory questions. "
+            f"3. ANSWER ONLY WHAT IS ASKED. If the user asks for current stock, report the stock and status, then STOP. DO NOT volunteer to draft a purchase order unless explicitly commanded to 'draft an order', 'buy more', or 'restock'. "
+            f"4. If drafting a PO, ALWAYS use the `suggested_qty` from your most recent `check_inventory` tool call. Only use {stats['next_7_total'] if exists else 50} as a fallback if you have not checked inventory yet. "
+            f"5. Never explain your math, mention 'fallbacks', or show your internal calculations to the user. Speak like a concise, professional corporate executive."
+        )
+        tools_to_use = supply_chain_tools
+
+    elif selected_agent == "RISK":
+        system_msg = (
+            "You are the Risk Management Agent. Your job is to monitor real-world disruptions "
+            "like weather delays or oil price spikes. Use your tools to fetch live data and "
+            "advise the user on how it affects the supply chain."
+        )
+        tools_to_use = supply_chain_tools
+
+    else:
+        system_msg = "You are a helpful Supply Chain AI. Greet the user and ask how you can help."
+        tools_to_use = []
+
+    # ---------------------------------------------------------
+    # FINAL LLM GENERATION WITH SELECTED AGENT & MEMORY
+    # ---------------------------------------------------------
+    messages = [{"role": "system", "content": system_msg}]
+
+    # Inject the last 4 messages to give the AI short-term memory
+    for h in req.history[-4:]:
+        role = "user" if h.get("sender") == "user" else "assistant"
+        # Only inject text content, strip out widget data to save tokens
+        messages.append({"role": role, "content": h.get("content", "")})
+
+    # Append the current user message
+    messages.append({"role": "user", "content": req.message})
+
+    response = requests.post(
+        "http://localhost:11434/api/chat",
+        json={
+            "model": "llama3.1",
+            "messages": messages,
+            "tools": tools_to_use,
+            "stream": False
+        }
+    ).json()
+
+    assistant_message = response.get("message", {})
+
+    # ── FALLBACK: Llama sometimes writes tool JSON in content instead of tool_calls ──
+    if not assistant_message.get("tool_calls") and assistant_message.get("content"):
+        import re
+        content = assistant_message["content"]
+        matches = re.findall(r'\{"name":\s*"(\w+)",\s*"parameters":\s*(\{.*?\})\}', content, re.DOTALL)
+        if matches:
+            parsed_calls = []
+            for name, params_str in matches:
+                try:
+                    parsed_calls.append({
+                        "function": {
+                            "name": name,
+                            "arguments": json.loads(params_str)
+                        }
                     })
-            # Capture widget trigger from tool results
-            if getattr(msg, 'type', '') == 'tool' or msg.__class__.__name__ == 'ToolMessage':
-                if getattr(msg, 'name', '') == 'draft_purchase_order':
+                except json.JSONDecodeError:
+                    pass
+            if parsed_calls:
+                assistant_message["tool_calls"] = parsed_calls
+    # ── END FALLBACK ──
+
+    # DID THE SPECIALIST USE A TOOL?
+    if assistant_message.get("tool_calls"):
+        messages.append(assistant_message)
+
+        # Holds inventory data if check_inventory runs — used as fallback widget
+        # only if draft_purchase_order is NOT subsequently called in the same turn.
+        pending_inventory_widget = None
+
+        for tool_call in assistant_message["tool_calls"]:
+            func_name = tool_call["function"]["name"]
+            args = tool_call["function"]["arguments"]
+            agent_thoughts.append({"tool": func_name, "args": args})
+
+            # --- DRAFT PURCHASE ORDER (Generative UI) ---
+            if func_name == "draft_purchase_order":
+                # Extract and forcefully uppercase it
+                extracted_family = str(args.get('family', '')).upper().strip()
+
+                # If they said "GROCERY" instead of "GROCERY I", fix it
+                if extracted_family == "GROCERY":
+                    extracted_family = "GROCERY I"
+                if extracted_family == "BREAD":
+                    extracted_family = "BREAD/BAKERY"
+
+                # Use the AI's choice if valid, otherwise fallback to the UI dropdown
+                valid_categories = ["GROCERY I", "BEVERAGES", "PRODUCE", "CLEANING", "DAIRY", "BREAD/BAKERY", "AUTOMOTIVE"]
+                target_family = extracted_family if extracted_family in valid_categories else (req.family or "GROCERY I")
+
+                raw_qty = args.get('suggested_qty')
+
+                # Priority 1: qty came from the LLM args directly
+                # Priority 2: a check_inventory ran earlier in this same turn
+                if not raw_qty and pending_inventory_widget:
+                    raw_qty = pending_inventory_widget["decision"]["suggested_order_qty"]
+
+                # Priority 3: no qty anywhere — run the inventory math right now
+                # so we never fall back to an arbitrary default like 50
+                if not raw_qty:
                     try:
-                        content_str = msg.content
-                        if "WIDGET_TRIGGER" in content_str:
-                            parsed = json.loads(content_str)
-                            if parsed.get("WIDGET_TRIGGER") == "purchase_order":
-                                final_type = "purchase_order"
-                                widget_data = parsed
+                        fallback_inv = predict_inventory_advanced(InventoryRequest(
+                            store_id=req.store_id,
+                            family=target_family,
+                            current_stock=req.current_stock
+                        ))
+                        raw_qty = fallback_inv["decision"]["suggested_order_qty"]
                     except Exception as e:
-                        pass
+                        print(f"⚠️ Could not compute qty for PO: {str(e)}")
+                        raw_qty = int(stats['next_7_total']) if exists else 50
 
-        # Fallback: LLaMA 3.1 sometimes fails native tool invocation and outputs JSON as text.
-        if '"name": "draft_purchase_order"' in raw_output:
-            try:
-                match = re.search(r'\{"name": "draft_purchase_order", "parameters": (\{.*?\})\}', raw_output)
-                if match:
-                    params = json.loads(match.group(1))
-                    fam = params.get("family", req.family)
-                    qty = params.get("quantity", 100)
-                    
-                    widget_json_str = draft_purchase_order.invoke({"family": fam, "quantity": qty})
-                    
-                    # Instead of injecting into raw_output, just parse it
-                    parsed_widget = json.loads(widget_json_str)
-                    if parsed_widget.get("WIDGET_TRIGGER") == "purchase_order":
-                        final_type = "purchase_order"
-                        widget_data = parsed_widget
-                    
-                    raw_output = re.sub(r'To answer.*?function call: \{.*?\}', '', raw_output, flags=re.IGNORECASE|re.DOTALL)
-                    raw_output = re.sub(r'\{"name": "draft_purchase_order".*?\}', '', raw_output)
-            except Exception as e:
-                print(f"Fallback parse failed: {e}")
+                qty = int(raw_qty)
+                estimated_cost = float(qty) * 15.5
 
-        # Just in case `WIDGET_TRIGGER` is still in the text for some reason
-        if "WIDGET_TRIGGER" in raw_output:
-            try:
-                match = re.search(r'\{.*?"WIDGET_TRIGGER".*?\}', raw_output, re.DOTALL)
-                if match:
-                    parsed_widget = json.loads(match.group(0))
-                    if parsed_widget.get("WIDGET_TRIGGER") == "purchase_order":
-                        final_type = "purchase_order"
-                        widget_data = parsed_widget
-                    raw_output = raw_output.replace(match.group(0), "").strip()
-            except Exception as e:
-                pass
+                return {
+                    "type": "purchase_order",
+                    "content": f"**Executive Agent:** I have drafted a purchase order for {qty} units of {target_family}.",
+                    "widget_data": {
+                        "family": target_family,
+                        "suggested_qty": qty,
+                        "supplier": "Default Supplier Inc.",
+                        "estimated_cost": estimated_cost
+                    },
+                    "thought_process": agent_thoughts
+                }
 
-        if not agent_thoughts:
-            agent_thoughts.append({
-                "tool": "ReAct Langchain Executor",
-                "args": {"tasks": "Reasoning complete"}
-            })
+            # --- CHECK INVENTORY ---
+            elif func_name == "check_inventory":
+                target_family = args.get('family', req.family)
+
+                inventory_req = InventoryRequest(
+                    store_id=req.store_id,
+                    family=target_family,
+                    current_stock=req.current_stock
+                )
+
+                try:
+                    real_inventory_data = predict_inventory_advanced(inventory_req)
+
+                    # Store the result so draft_purchase_order (if called next)
+                    # can use the real suggested_qty instead of guessing.
+                    pending_inventory_widget = real_inventory_data
+
+                    # Feed a compact summary back into the message chain so the LLM
+                    # knows the numbers and can decide its next action (e.g. draft PO).
+                    messages.append({
+                        "role": "tool",
+                        "name": func_name,
+                        "content": json.dumps({
+                            "current_stock": req.current_stock, # <--- MUST HAVE THIS!
+                            "suggested_qty": real_inventory_data["decision"]["suggested_order_qty"],
+                            "stockout_probability_pct": real_inventory_data["decision"]["stockout_probability_pct"],
+                            "status": real_inventory_data["decision"]["status"]
+                        })
+                    })
+
+                except Exception as e:
+                    print(f"❌ Inventory Tool Crash: {str(e)}")
+                    messages.append({
+                        "role": "tool",
+                        "name": func_name,
+                        "content": json.dumps({"error": str(e)})
+                    })
+
+            # --- TEXT TO SQL: ASK DATABASE ---
+            elif func_name == "ask_database":
+                target_question = args.get('question')
+                try:
+                    db_result = execute_text_to_sql(target_question)
+                    tool_result = {"data": db_result}
+                except Exception as e:
+                    tool_result = {"error": str(e)}
+                
+                messages.append({
+                    "role": "tool",
+                    "name": func_name,
+                    "content": json.dumps(tool_result)
+                })
+
+            # --- LIVE API: CHECK MARKET CONDITIONS ---
+            elif func_name == "check_market_conditions":
+                target_query = args.get('query', 'general')
+                try:
+                    market_result = get_live_market_data(target_query)
+                    tool_result = {"live_data": market_result}
+                except Exception as e:
+                    tool_result = {"error": str(e)}
+
+                messages.append({
+                    "role": "tool",
+                    "name": func_name,
+                    "content": json.dumps(tool_result)
+                })
+
+        # If check_inventory ran but draft_purchase_order was never called,
+        # return the inventory widget now (user asked to check stock, not draft a PO).
+        if pending_inventory_widget:
+            return {
+                "type": "inventory_check",
+                "content": f"**Executive Agent:** I've run the probabilistic risk models on the {req.family} category. Here is your decision dashboard:",
+                "widget_data": pending_inventory_widget,
+                "thought_process": agent_thoughts
+            }
+
+        # Get final text response after all tools finish
+        final_response = requests.post(
+            "http://localhost:11434/api/chat",
+            json={"model": "llama3.1", "messages": messages, "stream": False}
+        ).json()
 
         return {
-            "type": final_type,
-            "content": raw_output.strip(),
-            "widget_data": widget_data,
+            "type": "message",
+            "content": f"**{selected_agent.capitalize()} Agent:** {final_response.get('message', {}).get('content', '')}",
             "thought_process": agent_thoughts
         }
 
-    except Exception as e:
-        print(f"❌ ReAct Agent Crash: {str(e)}")
-        return {
-            "type": "error",
-            "content": f"System error executing agent loop: {str(e)}",
-            "thought_process": []
-        }
+    final_text = assistant_message.get("content", "I didn't quite catch that.")
+    return {
+        "type": "message",
+        "content": f"**{selected_agent.capitalize()} Agent:** {final_text}",
+        "thought_process": agent_thoughts
+    }
 
 @app.post("/submit_order")
 def submit_order(req: OrderSubmitRequest):
+    # In a real app, this is where you would run an SQL UPDATE command 
+    # to insert the new Purchase Order into your database.
+    
     if req.action == "approve":
-        estimated_cost = req.quantity * 15.5
-        try:
-            with engine.connect() as connection:
-                connection.execute(text("""
-                    CREATE TABLE IF NOT EXISTS purchase_orders (
-                        id SERIAL PRIMARY KEY,
-                        family VARCHAR(255),
-                        quantity INTEGER,
-                        estimated_cost FLOAT,
-                        status VARCHAR(50),
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                    )
-                """))
-                connection.execute(text("""
-                    INSERT INTO purchase_orders (family, quantity, estimated_cost, status)
-                    VALUES (:family, :quantity, :cost, 'APPROVED')
-                """), {"family": req.family.upper(), "quantity": req.quantity, "cost": estimated_cost})
-                connection.commit()
-                print(f"✅ SUCCESS: Ordered {req.quantity} of {req.family} to DB")
-                return {"status": "success", "message": f"Order for {req.quantity} units placed!"}
-        except Exception as e:
-            print(f"⚠️ Failed to save PO to db: {e}")
-            raise HTTPException(status_code=500, detail="DB Error")
-            
+        print(f"✅ SUCCESS: Ordered {req.quantity} of {req.family} for Store {req.store_id}")
+        return {"status": "success", "message": f"Order for {req.quantity} units placed successfully!"}
+    
     elif req.action == "reject":
         print(f"❌ REJECTED: Cancelled order for {req.family}")
         return {"status": "cancelled", "message": "Order was rejected."}

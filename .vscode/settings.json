@@ -1,0 +1,13 @@
+{
+    "python.defaultInterpreterPath": "C:/Users/ADWAITH/Documents/Sales Forcasting/ProphetBased/.venv/Scripts/python.exe",
+    "python.analysis.extraPaths": [
+        "C:/Users/ADWAITH/Documents/Sales Forcasting/ProphetBased/.venv/Lib/site-packages"
+    ],
+    "python.analysis.typeCheckingMode": "off",
+    "python.analysis.diagnosticSeverityOverrides": {
+        "reportMissingImports": "none",
+        "reportMissingModuleSource": "none",
+        "reportGeneralTypeIssues": "none"
+    },
+    "python.terminal.useEnvFile": true
+}

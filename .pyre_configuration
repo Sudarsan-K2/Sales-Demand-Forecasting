@@ -1,0 +1,11 @@
+{
+    "source_directories": ["."],
+    "search_path": [".venv/Lib/site-packages"],
+    "exclude": [
+        ".venv/.*",
+        "node_modules/.*",
+        "sales-dashboard/.*",
+        "v1_archive/.*"
+    ],
+    "strict": false
+}
