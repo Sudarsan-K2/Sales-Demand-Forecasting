@@ -1,0 +1,98 @@
+# Sales Forecasting & Inventory Decision System Architecture
+
+This document describes the high-level architecture of the application. The system comprises a React frontend, a FastAPI Python backend, multiple distinct data layers (PostgreSQL, ChromaDB), and an Agentic AI system orchestrated by LangGraph.
+
+## Architecture Components
+
+### 1. Frontend (React / Client)
+- **User Interface (`sales-dashboard/src/`)**: 
+  - `Chatassistant.js`: The central multi-agent Chat interface (Analyst, Executive, Risk).
+  - `Inventory.js`: Visualizes Economic Order Quantities (EOQ) and stockout probabilities.
+  - `Dashboard.js`: Command center summarizing supply-chain intelligence and forecast graphs.
+- **State Management**: Client-side states (e.g., `familyStocks`, `chatMessages`) are synced globally via browser `localStorage`.
+- **API Communication**: The frontend communicates with the FastAPI backend via RESTful endpoints (`/chat`, `/available_categories`, `/predict`).
+
+### 2. Backend API (FastAPI)
+- **Core Server (`main.py`)**: A Python/FastAPI application acting as the mediator between the UI and all models/databases.
+- **REST Endpoints**: Serves chat requests, forecasting requests, and static category data.
+
+### 3. Agentic AI Layer (LangGraph & LangChain)
+- **Orchestration (`langgraph`)**: Uses `create_react_agent` to manage an iterative Reasoning and Acting (ReAct) loop.
+- **LLM**: Powered by OpenAI's `ChatOpenAI` wrapper (configured to use GitHub Models e.g. `gpt-4o`).
+- **AI Tools**:
+  1. `execute_text_to_sql`: Translates natural language into SQL to query the historical sales database.
+  2. `search_company_knowledge`: A Retrieval-Augmented Generation (RAG) tool that searches unstructured company documents.
+  3. `check_inventory_advanced`: Triggers the Prophet forecasting model to calculate stockout risk and EOQ.
+  4. `draft_purchase_order`: Sends a structured JSON payload back to the frontend to trigger a Purchase Order widget.
+
+### 4. Data Storage & Retrieval
+- **PostgreSQL Database**: Contains structured historical data (`historical_sales` table: dates, store IDs, item families, sales volume, promotions, oil prices).
+- **ChromaDB (Local Vector DB)**: Contains vector embeddings of internal company documents (`.txt` files representing news, emails, marketing briefs). Handled by `sentence-transformers` (`all-MiniLM-L6-v2`) for semantic search.
+
+### 5. Forecasting Engine (Prophet)
+- **Time-Series Models**: Facebook Prophet is used to generate mathematical forecasts for specific product families.
+- **Model Registry (`model_registry/`)**: Pre-trained Prophet JSON models are loaded into memory and evaluated upon request.
+
+---
+
+## Architecture Diagram (Mermaid.js)
+You can copy and paste the code below into a Mermaid renderer (like mermaid.live) to visualize this architecture.
+
+```mermaid
+graph TD
+    %% Define Styles
+    classDef frontend fill:#3b82f6,stroke:#1d4ed8,stroke-width:2px,color:white;
+    classDef backend fill:#10b981,stroke:#047857,stroke-width:2px,color:white;
+    classDef ai fill:#8b5cf6,stroke:#6d28d9,stroke-width:2px,color:white;
+    classDef data fill:#f59e0b,stroke:#b45309,stroke-width:2px,color:white;
+    classDef model fill:#ec4899,stroke:#be185d,stroke-width:2px,color:white;
+
+    %% Client Layer
+    subgraph Client ["Frontend (React)"]
+        UI_Dash[Dashboard]:::frontend
+        UI_Chat[Chat Assistant]:::frontend
+        UI_Inv[Inventory Optimizer]:::frontend
+        LS[(localStorage)]:::frontend
+    end
+
+    %% Network Connection
+    UI_Chat <-->|REST /chat, /predict| API[FastAPI Server]:::backend
+
+    %% Backend Layer
+    subgraph Server_Application ["Backend (Python FastAPI)"]
+        API
+        LG[LangGraph ReAct Agent]:::ai
+        LLM[OpenAI / GitHub Models]:::ai
+        
+        API --> LG
+        LG <--> LLM
+        
+        %% Tools available to the Agent
+        subgraph AI_Tools ["Agent Capabilities (Tools)"]
+            T_SQL[Text-to-SQL]:::ai
+            T_RAG[RAG Company Search]:::ai
+            T_Inv[Advanced Inventory Check]:::ai
+            T_PO[Draft Purchase Order]:::ai
+        end
+        
+        LG --> T_SQL
+        LG --> T_RAG
+        LG --> T_Inv
+        LG --> T_PO
+    end
+
+    %% Databases
+    DB_SQL[(PostgreSQL)]:::data
+    DB_VEC[(ChromaDB)]:::data
+
+    %% Models
+    M_PRO[Prophet Models]:::model
+    M_EMB[Sentence Transformer]:::model
+
+    %% Connect Tools to Resources
+    T_SQL <-->|SQL Queries| DB_SQL
+    T_RAG --> M_EMB
+    M_EMB <-->|Embeddings| DB_VEC
+    T_Inv <-->|Load JSON Forecasts| M_PRO
+    T_PO -.->|Widget Trigger| UI_Chat
+```
