@@ -1,67 +1,90 @@
 import os
 import chromadb
 from sentence_transformers import SentenceTransformer
-from langchain_community.document_loaders import DirectoryLoader, TextLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
+import PyPDF2
 
-# 1. Initialize ChromaDB (Local SQLite file-based DB)
+# Configure Paths
+KB_DIR = "./knowledge_base"
 CHROMA_DB_DIR = "./chroma_db"
-os.makedirs(CHROMA_DB_DIR, exist_ok=True)
 
-print("🚀 Starting Knowledge Base Ingestion...")
+def extract_text_from_pdf(pdf_path):
+    text = ""
+    try:
+        with open(pdf_path, 'rb') as f:
+            reader = PyPDF2.PdfReader(f)
+            for page in reader.pages:
+                extracted = page.extract_text()
+                if extracted:
+                    text += extracted + "\n"
+    except Exception as e:
+        print(f"Error reading PDF {pdf_path}: {e}")
+    return text
 
-# Setup Chroma Client
-client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+def chunk_text(text, chunk_size=1000, overlap=100):
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        chunks.append(text[start:end])
+        start += chunk_size - overlap
+    return chunks
 
-# Get or create collection
-collection_name = "supply_chain_knowledge"
+def ingest_documents():
+    print(f"📂 Scanning directoy: {KB_DIR}...")
+    if not os.path.exists(KB_DIR):
+        print("Directory does not exist. Creating it...")
+        os.makedirs(KB_DIR)
+        print("Done. Add some .txt or .pdf files and run again.")
+        return
 
-# Delete if exists so we can run this script multiple times cleanly
-try:
-    client.delete_collection(name=collection_name)
-except Exception:
-    pass
+    # Initialize Chroma
+    chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
+    collection = chroma_client.get_or_create_collection("supply_chain_knowledge")
+    embedder = SentenceTransformer("all-MiniLM-L6-v2")
 
-collection = client.create_collection(
-    name=collection_name,
-    metadata={"hnsw:space": "cosine"} # Use cosine similarity for text search
-)
+    documents = []
+    ids = []
+    metadatas = []
 
-# 2. Local Embedding Model (Runs on CPU, no API key needed)
-# Using a fast, lightweight sentence transformer model 
-print("⏳ Loading local embedding model (all-MiniLM-L6-v2)...")
-encoder = SentenceTransformer("all-MiniLM-L6-v2")
+    file_count = 0
+    for file in os.listdir(KB_DIR):
+        file_path = os.path.join(KB_DIR, file)
+        
+        content = ""
+        if file.endswith(".txt"):
+            try:
+                with open(file_path, 'r', encoding='utf-8') as f:
+                    content = f.read()
+            except Exception as e:
+                print(f"Error reading {file}: {e}")
+        elif file.endswith(".pdf"):
+            content = extract_text_from_pdf(file_path)
+            
+        if content.strip():
+            file_count += 1
+            chunks = chunk_text(content)
+            for i, chunk in enumerate(chunks):
+                doc_id = f"{file}_chunk_{i}"
+                if len(chunk.strip()) > 10:
+                    documents.append(chunk)
+                    ids.append(doc_id)
+                    metadatas.append({"source": file, "chunk": i})
 
-# 3. Load Documents from local /knowledge_base folder
-print("📂 Reading documents from ./knowledge_base...")
-loader = DirectoryLoader('./knowledge_base', glob="**/*.txt", loader_cls=TextLoader)
-documents = loader.load()
+    if not documents:
+        print("⚠️ No valid documents found or parsed.")
+        return
 
-print(f"📄 Found {len(documents)} logic files.")
+    print(f"🧬 Encoding {len(documents)} chunks from {file_count} files...")
+    embeddings = embedder.encode(documents).tolist()
 
-# 4. Split Text into Chunks
-# This ensures that long PDFs don't overwhelm the LLM context window
-text_splitter = RecursiveCharacterTextSplitter(
-    chunk_size=500,
-    chunk_overlap=50,
-    length_function=len,
-    is_separator_regex=False,
-)
-chunks = text_splitter.split_documents(documents)
-print(f"✂️ Split into {len(chunks)} chunks.")
-
-# 5. Embed and Store
-print("🧠 Generating embeddings and saving to ChromaDB...")
-for i, chunk in enumerate(chunks):
-    # Get vector representation
-    embedding = encoder.encode(chunk.page_content).tolist()
-    
-    # Store in ChromaDB
-    collection.add(
-        documents=[chunk.page_content],
-        embeddings=[embedding],
-        metadatas=[chunk.metadata],
-        ids=[f"chunk_{i}"]
+    print("💾 Saving to ChromaDB...")
+    collection.upsert(
+        documents=documents,
+        embeddings=embeddings,
+        ids=ids,
+        metadatas=metadatas
     )
+    print("✅ Ingestion Complete! The RAG agent can now search these documents.")
 
-print(f"✅ Success! Ingested {len(chunks)} chunks into ChromaDB at {CHROMA_DB_DIR}")
+if __name__ == "__main__":
+    ingest_documents()

@@ -1,18 +1,27 @@
 # pyre-ignore-all-errors
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Security, Request, Query
+from fastapi.security import APIKeyHeader
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from pydantic import BaseModel, Field, field_validator, ValidationInfo
 import pandas as pd
-from prophet.serialize import model_from_json
+from prophet import Prophet
+from prophet.serialize import model_from_json, model_to_json
 from sqlalchemy import create_engine, text
 from typing import List, Dict, Any, Optional
 import json
 import os
 import requests
+from contextvars import ContextVar
+
+_current_tenant_id: ContextVar[str] = ContextVar("current_tenant_id", default="anonymous")
 import re
 import math
 import scipy.stats as st
 import httpx
+import yfinance as yf
 
 # --- NEW IMPORTS FOR LANGCHAIN AND RAG ---
 from langchain_core.tools import tool
@@ -21,8 +30,25 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 from langgraph.prebuilt import create_react_agent
 from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import JsonOutputParser
 import chromadb
 from sentence_transformers import SentenceTransformer
+
+def get_llm():
+    def log_rate_limits(response):
+        rem = response.headers.get("x-ratelimit-remaining")
+        reset = response.headers.get("x-ratelimit-reset")
+        if rem is not None:
+            pass # keep quiet or print
+
+    http_client = httpx.Client(event_hooks={'response': [log_rate_limits]})
+    return ChatOpenAI(
+        model="gpt-4o-mini", 
+        temperature=0,
+        api_key=os.environ.get("GITHUB_TOKEN"),
+        base_url="https://models.inference.ai.azure.com",
+        http_client=http_client
+    )
 
 # Initialize ChromaDB Client
 CHROMA_DB_DIR = "./chroma_db"
@@ -37,6 +63,10 @@ except Exception as e:
     print(f"⚠️ Could not load ChromaDB: {e}")
 
 app = FastAPI(title="Sales & Inventory Decision System")
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REGISTRY_DIR = os.path.join(BASE_DIR, "model_registry")
 
@@ -56,6 +86,32 @@ DB_NAME = "SalesForecast"
 DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:5432/{DB_NAME}"
 engine = create_engine(DATABASE_URL)
 
+api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
+
+def verify_api_key(api_key: str = Security(api_key_header)):
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing API Key")
+    
+    with engine.connect() as conn:
+        conn.execute(text("""
+            CREATE TABLE IF NOT EXISTS api_keys (
+                id SERIAL PRIMARY KEY,
+                key VARCHAR(255) UNIQUE,
+                user_id VARCHAR(50)
+            )
+        """))
+        try:
+            conn.execute(text("INSERT INTO api_keys (key, user_id) VALUES ('secret-token', 'admin_user') ON CONFLICT DO NOTHING"))
+            conn.commit()
+        except Exception as e:
+            print(f"Seed insert skipped: {e}")
+            
+        res = conn.execute(text("SELECT user_id FROM api_keys WHERE key = :k"), {"k": api_key}).fetchone()
+        if not res:
+            raise HTTPException(status_code=401, detail="Invalid API Key")
+        
+        return res[0]
+
 # --- DATABASE SCHEMA CONTEXT ---
 # This is the "map" the AI uses to navigate your database. 
 # Adjust the columns to match your actual PostgreSQL tables.
@@ -70,6 +126,7 @@ Columns:
 - oil_price (FLOAT): The daily price of crude oil.
 """
 
+@tool
 def execute_text_to_sql(question: str) -> str:
     """
     Translates natural language to SQL, executes it, and returns the raw data.
@@ -95,17 +152,10 @@ def execute_text_to_sql(question: str) -> str:
     
     try:
         # 2. Ask the LLM to write the query (Zero creativity allowed)
-        response = requests.post(
-            "http://localhost:11434/api/chat",
-            json={
-                "model": "llama3.1",
-                "messages": [{"role": "system", "content": sql_prompt}],
-                "stream": False,
-                "options": {"temperature": 0.0} # Enforce deterministic output
-            }
-        ).json()
+        llm = get_llm()
+        response = llm.invoke([{"role": "system", "content": sql_prompt}])
         
-        raw_sql = response.get("message", {}).get("content", "").strip()
+        raw_sql = response.content.strip()
         
         # Aggressive stripping to catch LLM conversational habits
         raw_sql = raw_sql.replace("```sql", "").replace("```", "")
@@ -134,35 +184,65 @@ def execute_text_to_sql(question: str) -> str:
 
 # --- DATA MODELS ---
 class PredictionRequest(BaseModel):
-    store_id: int
-    family: str
-    months: int = 3
+    store_id: int = Field(..., gt=0, description="Store ID must be positive")
+    family: str = Field(..., min_length=2, max_length=100)
+    months: int = Field(3, gt=0, le=24, description="Forecast horizon in months")
     simulate_promo: bool = False
-    custom_oil_price: Optional[float] = None
+    custom_oil_price: Optional[float] = Field(None, gt=0, le=500)
+
+    @field_validator('family')
+    @classmethod
+    def sanitize_family(cls, v: str, info: ValidationInfo) -> str:
+        # Prevent obvious SQL injection characters
+        if re.search(r"['\";=]", v):
+            raise ValueError("Invalid characters in family name")
+        return v.upper().strip()
 
 class InventoryRequest(BaseModel):
-    store_id: int
-    family: str
-    lead_time_days: int = 7       # Time from supplier order to delivery
-    current_stock: int = 0        # Units currently on shelf
-    service_level: float = 0.95   # Desired confidence (95% standard)
-    order_cost: float = 50.0      # Cost to process a PO/Delivery
-    holding_cost: float = 0.15    # Cost to store 1 unit for a year
-    unit_price: float = 2.50      # Average price of the grocery item
-    is_perishable: bool = True    # Flag for grocery spoilage
+    store_id: int = Field(..., gt=0)
+    family: str = Field(..., min_length=2, max_length=100)
+    lead_time_days: int = Field(7, ge=0, le=180) 
+    current_stock: int = Field(0, ge=0)       
+    service_level: float = Field(0.95, gt=0, lt=1)  
+    order_cost: float = Field(50.0, ge=0)     
+    holding_cost: float = Field(0.15, ge=0)   
+    unit_price: float = Field(2.50, gt=0)     
+    is_perishable: bool = True   
     
+    @field_validator('family')
+    @classmethod
+    def sanitize_family(cls, v: str, info: ValidationInfo) -> str:
+        if re.search(r"['\";=]", v):
+            raise ValueError("Invalid characters in family name")
+        return v.upper().strip()
+
 class ChatRequest(BaseModel):
-    message: str
-    store_id: int
-    family: str
-    current_stock: int = 0
-    history: List[Dict[str, Any]] = []
+    message: str = Field(..., min_length=1, max_length=2000)
+    store_id: int = Field(..., gt=0)
+    family: str = Field(..., min_length=2, max_length=100)
+    current_stock: int = Field(0, ge=0)
+    history: List[Dict[str, Any]] = Field(default_factory=list)
+    session_id: str = Field("default_session", max_length=100)
+
+    @field_validator('family')
+    @classmethod
+    def sanitize_family(cls, v: str, info: ValidationInfo) -> str:
+        if re.search(r"['\";=]", v):
+            raise ValueError("Invalid characters in family name")
+        return v.upper().strip()
 
 class OrderSubmitRequest(BaseModel):
-    store_id: int
-    family: str
-    quantity: int
-    action: str
+    store_id: int = Field(..., gt=0)
+    family: str = Field(..., min_length=2, max_length=100)
+    quantity: int = Field(..., gt=0)
+    action: str = Field(..., pattern="^(approve|reject)$")
+    
+    @field_validator('family')
+    @classmethod
+    def sanitize_family(cls, v: str, info: ValidationInfo) -> str:
+        if re.search(r"['\";=]", v):
+            raise ValueError("Invalid characters in family name")
+        return v.upper().strip()
 
 # --- HELPER: LOAD MODEL ---
 def load_model(store_id: int, family: str):
@@ -338,35 +418,70 @@ def get_market_sentiment(m, periods=30):
         "peak_day": peak_date
     }
 
-# --- EXTERNAL API MOCK (For the Risk Agent) ---
+# --- EXTERNAL API INTEGRATION (For the Risk Agent) ---
+@tool
 def get_live_market_data(query: str) -> str:
     """
-    Simulates fetching real-time data from an external API (like Bloomberg or Open-Meteo).
+    Fetches real-time data from external APIs (Weather from Open-Meteo, Oil from YFinance).
     """
     query = query.lower()
     print(f"🌍 Fetching live API data for: {query}")
     
-    if "oil" in query or "price" in query:
-        # Simulate an oil price spike
-        return json.dumps({
-            "commodity": "Crude Oil (WTI)",
-            "current_price_usd": 94.50,
-            "status": "ELEVATED",
-            "news_alert": "Prices surging due to unexpected OPEC production cuts."
-        })
-    elif "weather" in query or "storm" in query:
-        # Simulate a shipping disruption
-        return json.dumps({
-            "location": "Primary West Coast Port",
-            "weather_status": "Severe Hurricane Warning",
-            "shipping_delay_days": 4,
-            "recommendation": "Increase safety stock immediately."
-        })
-    else:
-        return json.dumps({"status": "Normal", "alert": "No major disruptions detected."})
+    try:
+        if "oil" in query or "price" in query:
+            # Live Crude Oil Price (WTI)
+            ticker = yf.Ticker("CL=F")
+            data = ticker.history(period="1d")
+            if not data.empty:
+                current_price = round(float(data['Close'].iloc[-1]), 2)
+                
+                # Simple logic for elevated alert
+                status = "ELEVATED" if current_price > 85.0 else "NORMAL"
+                return json.dumps({
+                    "commodity": "Crude Oil (WTI)",
+                    "current_price_usd": current_price,
+                    "status": status,
+                    "source": "yfinance API"
+                })
+            else:
+                return "Error: Could not retrieve live oil price."
+                
+        elif "weather" in query or "storm" in query:
+            # Live Weather for Seattle (example primary port location)
+            # 47.6062° N, 122.3321° W
+            url = "https://api.open-meteo.com/v1/forecast?latitude=47.6062&longitude=-122.3321&current=temperature_2m,precipitation,wind_speed_10m&timezone=America%2FLos_Angeles"
+            resp = requests.get(url, timeout=5)
+            data = resp.json()
+            current = data.get("current", {})
+            
+            wind_speed = current.get("wind_speed_10m", 0)
+            precip = current.get("precipitation", 0)
+            
+            status = "Normal"
+            alert = "No major disruptions."
+            
+            # Simple threshold for severe weather
+            if wind_speed > 40 or precip > 10:
+                status = "Severe Weather Warning"
+                alert = f"High winds ({wind_speed} km/h) or heavy rain ({precip} mm) detected in Seattle port area."
+                
+            return json.dumps({
+                "location": "Seattle (Primary Port)",
+                "temperature_c": current.get("temperature_2m"),
+                "wind_speed_kmh": wind_speed,
+                "precipitation_mm": precip,
+                "weather_status": status,
+                "news_alert": alert
+            })
+            
+        else:
+            return json.dumps({"status": "Normal", "alert": "No targeted APIs available for this query."})
+            
+    except Exception as e:
+        return f"External API Error: {str(e)}"
 
 # --- ENDPOINT 1: PREDICTION & EXPLANATION ---
-@app.post("/predict")
+@app.post("/predict", dependencies=[Depends(verify_api_key)])
 def predict_sales(req: PredictionRequest):
     m, metrics, exists = load_model(req.store_id, req.family)
     if not exists:
@@ -420,13 +535,36 @@ def predict_sales(req: PredictionRequest):
     }
 
     # Return Result
-    result_cols = ['ds', 'yhat', 'yhat_lower', 'yhat_upper'] # Added confidence intervals
+    # Create formatted strings for easier consumption by the LLM and the UI
+    forecast['confidence_band_formatted'] = forecast.apply(
+        lambda row: f"Low: {int(row['yhat_lower'])}, High: {int(row['yhat_upper'])}", axis=1
+    )
+    result_cols = ['ds', 'yhat', 'yhat_lower', 'yhat_upper', 'confidence_band_formatted']
 
     # --- NEW: SHIFT DATES TO CURRENT DAY FOR THE UI ---
     last_historical_date = m.history['ds'].max()
     time_offset = pd.Timestamp.now().normalize() - last_historical_date
     forecast['ds'] = forecast['ds'] + time_offset
     # --------------------------------------------------
+
+    # Model Freshness Label
+    freshness = "Unknown"
+    if metrics and "last_trained" in metrics:
+        import datetime
+        try:
+            # Strip out microseconds if present before parsing
+            last_dt_str = metrics["last_trained"].split('.')[0]
+            last_dt = datetime.datetime.strptime(last_dt_str, "%Y-%m-%d %H:%M:%S")
+            days_ago = (datetime.datetime.now() - last_dt).days
+            if days_ago == 0:
+                freshness = "Trained Today"
+            elif days_ago < 7:
+                freshness = f"Trained {days_ago} days ago"
+            else:
+                freshness = f"Stale ({days_ago} days old)"
+        except:
+            pass
+    metrics["freshness_label"] = freshness
 
     return {
         "metrics": metrics,
@@ -435,7 +573,7 @@ def predict_sales(req: PredictionRequest):
     }
 
 # --- ENDPOINT 2: INVENTORY DECISION SUPPORT ---
-@app.post("/inventory")
+@app.post("/inventory", dependencies=[Depends(verify_api_key)])
 def predict_inventory(req: InventoryRequest):
     m, metrics, exists = load_model(req.store_id, req.family)
     if not exists:
@@ -454,37 +592,47 @@ def predict_inventory(req: InventoryRequest):
     # 2. Extract Demand Distributions
     expected_demand = future_data['yhat'].sum()
     worst_case_demand = future_data['yhat_upper'].sum()
-    std_dev = (worst_case_demand - expected_demand) / 1.645 # Approx standard deviation from Prophet 90% CI
+    
+    # Standard deviation of demand over the lead time window
+    demand_std_dev_lt = (worst_case_demand - expected_demand) / 1.645 # Approx from Prophet 90% CI
+    
+    # ADVANCED EOQ MATH: Add Lead-Time Variability
+    # Assume historical supplier lead time std dev is 2 days as a baseline proxy 
+    daily_demand = expected_demand / req.lead_time_days if req.lead_time_days > 0 else 0
+    lead_time_std_dev = 2.0 
+    
+    # Combined variance = (Variance of demand during LT) + (Daily Demand^2 * Variance of LT)
+    variance_demand_lt = demand_std_dev_lt ** 2
+    variance_lt = lead_time_std_dev ** 2
+    
+    total_std_dev = math.sqrt(variance_demand_lt + ((daily_demand ** 2) * variance_lt))
 
     # 3. Probabilistic Stockout Risk
-    # What is the probability that actual demand exceeds our current stock?
     if req.current_stock <= 0:
         stockout_prob = 0.99
     else:
-        # Z-score of our current stock against the demand distribution
-        z_score = (req.current_stock - expected_demand) / (std_dev if std_dev > 0 else 1)
+        # Z-score using the advanced combined standard deviation
+        z_score = (req.current_stock - expected_demand) / (total_std_dev if total_std_dev > 0 else 1)
         stockout_prob = 1.0 - st.norm.cdf(z_score)
 
     # 4. Financial Optimization (EOQ)
-    # Convert lead time demand to an annualized rate for the formula
-    annualized_demand = (expected_demand / req.lead_time_days) * 365 if req.lead_time_days > 0 else 0
-
+    annualized_demand = daily_demand * 365
     if annualized_demand > 0:
         optimal_order_qty = math.sqrt((2 * annualized_demand * req.order_cost) / (req.holding_cost * req.unit_price))
     else:
         optimal_order_qty = 0
 
-    # 5. Spoilage Penalty (Newsvendor logic for Groceries)
+    # 5. Spoilage Penalty 
     spoilage_risk = 0
     if req.is_perishable and req.current_stock > expected_demand * 1.5:
-        # If we have 50% more stock than expected demand, flag high spoilage risk
-        spoilage_risk = (req.current_stock - expected_demand) * (req.unit_price * 0.4) # Assume 40% loss on clearance/spoilage
+        spoilage_risk = (req.current_stock - expected_demand) * (req.unit_price * 0.4) 
 
     # 6. Final Decision Logic
-    safety_stock = worst_case_demand - expected_demand
+    # Safety stock based on the combined standard deviation hitting a 95% service level (Z=1.645)
+    safety_stock = 1.645 * total_std_dev
     needed_stock = expected_demand + safety_stock
 
-    # We order the EOQ, but ensure it at least covers our immediate safety needs
+    # Order the EOQ, but ensure it at least covers our immediate safety needs
     suggested_order = max((needed_stock - req.current_stock), optimal_order_qty)
 
     status = "OPTIMAL"
@@ -513,7 +661,7 @@ def predict_inventory(req: InventoryRequest):
     }
 
 # --- ENDPOINT 3: HISTORICAL ANOMALIES (NEW) ---
-@app.post("/analyze_history")
+@app.post("/analyze_history", dependencies=[Depends(verify_api_key)])
 def analyze_history(req: InventoryRequest): # Reusing InventoryRequest for simplicity
     m, _, exists = load_model(req.store_id, req.family)
     if not exists:
@@ -545,7 +693,7 @@ def analyze_history(req: InventoryRequest): # Reusing InventoryRequest for simpl
         upper = row['yhat_upper']
 
         if actual > upper or actual < lower:
-            severity = "High" if (actual > upper * 1.2 or actual < lower * 0.8) else "Moderate"
+            severity = "High" if (actual > upper * 1.2 or actual < lower * 0.8) else "Medium"
 
             # Shift the anomaly date
             shifted_date = row['ds'] + time_offset
@@ -554,7 +702,7 @@ def analyze_history(req: InventoryRequest): # Reusing InventoryRequest for simpl
                 "date": shifted_date.strftime("%Y-%m-%d"),
                 "actual": float(actual),
                 "expected": float(row['yhat']),
-                "type": "Spike" if actual > upper else "Dip",
+                "type": "Spike" if actual > upper else "Drop",
                 "severity": severity
             })
     
@@ -563,8 +711,99 @@ def analyze_history(req: InventoryRequest): # Reusing InventoryRequest for simpl
     
     return {
         "anomaly_count": len(anomalies),
-        "recent_anomalies": anomalies[:10]  # Top 10 most recent
+        "recent_anomalies": anomalies[:100]  # Return up to 100 for the Intelligence Center explorer
     }
+
+# --- ENDPOINT 4: MODEL RETRAINING (NEW) ---
+@app.post("/retrain", dependencies=[Depends(verify_api_key)])
+def retrain_model(req: PredictionRequest):
+    """
+    Pulls fresh data from the database for the given store and family, 
+    refits the Prophet model, and saves it to the model registry.
+    """
+    store_id = req.store_id
+    family = req.family.upper()
+    
+    try:
+        # 1. Fetch historical data from DB
+        query = text("""
+            SELECT date as ds, y, onpromotion, oil_price 
+            FROM training_data 
+            WHERE store_nbr = :s AND family = :f
+            ORDER BY date ASC
+        """)
+        with engine.connect() as conn:
+            df = pd.read_sql(query, conn, params={"s": store_id, "f": family})
+            
+        if df.empty:
+            raise HTTPException(status_code=404, detail="No historical data found for this store and family.")
+            
+        # Ensure correct column types
+        df['ds'] = pd.to_datetime(df['ds'])
+        df['y'] = pd.to_numeric(df['y'])
+        df['onpromotion'] = pd.to_numeric(df['onpromotion']).fillna(0)
+        df['oil_price'] = pd.to_numeric(df['oil_price']).fillna(90.0)
+        
+        # 2. Initialize and fit new Prophet model
+        m = Prophet(yearly_seasonality=True, weekly_seasonality=True, daily_seasonality=False)
+        m.add_regressor('onpromotion')
+        m.add_regressor('oil_price')
+        
+        m.fit(df)
+        
+        # 3. Save to Registry
+        if not os.path.exists(REGISTRY_DIR):
+            os.makedirs(REGISTRY_DIR)
+            
+        model_filename = f"s{store_id}_{family}.json"
+        metrics_filename = f"s{store_id}_{family}_metrics.json"
+        
+        with open(os.path.join(REGISTRY_DIR, model_filename), 'w') as fout:
+            json.dump(model_to_json(m), fout)
+            
+        # Update metrics to indicate fresh training date
+        import datetime
+        from sklearn.metrics import mean_absolute_error, mean_squared_error
+        import numpy as np
+        now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        # Compute in-sample MAE, RMSE, MAPE for Intelligence Center metric cards
+        try:
+            in_sample = m.predict(m.history)
+            y_true = m.history['y'].values
+            y_pred = in_sample['yhat'].values
+            mae  = round(float(mean_absolute_error(y_true, y_pred)), 2)
+            rmse = round(float(np.sqrt(mean_squared_error(y_true, y_pred))), 2)
+            # Use wMAPE (Volume-Weighted MAPE) to completely avoid the small-denominator explosion
+            # wMAPE = SUM(|y_true - y_pred|) / SUM(|y_true|)
+            total_actuals = np.sum(np.abs(y_true))
+            if total_actuals > 0:
+                mape = round(float(np.sum(np.abs(y_true - y_pred)) / total_actuals) * 100, 2)
+            else:
+                mape = 0.0
+        except Exception as metric_err:
+            print(f"⚠️ Could not compute metrics: {metric_err}")
+            mae, rmse, mape = 0.0, 0.0, 0.0
+
+        metrics = {
+            "mae": mae,
+            "rmse": rmse,
+            "mape": mape,
+            "last_trained": now_str,
+            "status": "Healthy"
+        }
+        with open(os.path.join(REGISTRY_DIR, metrics_filename), 'w') as fout:
+            json.dump(metrics, fout)
+            
+        return {
+            "status": "success", 
+            "message": f"Successfully retrained model for {family} at Store {store_id}",
+            "last_trained": now_str,
+            "data_points_used": len(df)
+        }
+    except Exception as e:
+        print(f"Failed to retrain model: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to retrain: {str(e)}")
 
 # --- AGENT TOOLBOX (LangChain Tools) ---
 
@@ -628,16 +867,20 @@ def check_inventory_advanced(store_id: int, family: str, current_stock: int) -> 
 @tool
 def draft_purchase_order(family: str, quantity: int) -> str:
     """Triggers the UI to display a draft purchase order widget to the user."""
-    # This returns the JSON trigger format to show the visual PO button on the frontend.
-    estimated_cost = float(quantity) * 15.5
-    
-    # Actually write the draft order into the database
     try:
+        if quantity <= 0:
+            return "Error: Quantity must be greater than zero."
+
+        tenant_id = _current_tenant_id.get()
+        estimated_cost = float(quantity) * 15.5
+        
+        # Actually write the draft order into the database
         with engine.connect() as connection:
             # Check if table exists, if not create a simple one
             connection.execute(text("""
                 CREATE TABLE IF NOT EXISTS purchase_orders (
                     id SERIAL PRIMARY KEY,
+                    tenant_id VARCHAR(50) DEFAULT 'admin_user',
                     family VARCHAR(255),
                     quantity INTEGER,
                     estimated_cost FLOAT,
@@ -648,38 +891,53 @@ def draft_purchase_order(family: str, quantity: int) -> str:
             
             # Insert the draft order
             connection.execute(text("""
-                INSERT INTO purchase_orders (family, quantity, estimated_cost, status)
-                VALUES (:family, :quantity, :cost, 'DRAFT')
-            """), {"family": family.upper(), "quantity": quantity, "cost": estimated_cost})
+                INSERT INTO purchase_orders (tenant_id, family, quantity, estimated_cost, status)
+                VALUES (:tenant_id, :family, :quantity, :cost, 'DRAFT')
+            """), {"tenant_id": tenant_id, "family": family.upper(), "quantity": quantity, "cost": estimated_cost})
             
             connection.commit()
-            print(f"✅ Draft PO saved to database for {quantity} units of {family}.")
+            print(f"✅ Draft PO saved to database for {quantity} units of {family} under tenant {tenant_id}.")
+
+        return json.dumps({
+            "WIDGET_TRIGGER": "purchase_order",
+            "family": family.upper(),
+            "suggested_qty": quantity,
+            "estimated_cost": estimated_cost,
+            "supplier": "Standard General Distributors"
+        })
     except Exception as e:
         print(f"⚠️ Failed to save PO to database: {e}")
+        return f"Error drafting purchase order: {str(e)}"
 
-    return json.dumps({
-        "WIDGET_TRIGGER": "purchase_order",
-        "family": family.upper(),
-        "suggested_qty": quantity,
-        "estimated_cost": estimated_cost,
-        "supplier": "Standard General Distributors"
-    })
+@tool
+def lookup_stakeholders(family: str) -> str:
+    """Looks up the vendor and internal buyer for a given product family."""
+    stakeholders = STAKEHOLDER_DB.get(family.upper(), DEFAULT_STAKEHOLDERS)
+    return json.dumps(stakeholders)
+
+@tool
+def check_recent_anomalies(store_id: int, family: str) -> str:
+    """Checks the historical data to detect past spikes or dips in demand for this product family."""
+    try:
+        req = InventoryRequest(store_id=store_id, family=family)
+        data = analyze_history(req)
+        return f"Found {data['anomaly_count']} historical anomalies. Top recent: {json.dumps(data['recent_anomalies'][:3])}"
+    except Exception as e:
+        return f"Error checking anomalies: {str(e)}"
 
 # The tools list for LangChain
-# Wrap the helper functions with @tool for the agent
-execute_text_to_sql_tool = tool(execute_text_to_sql)
-get_live_market_data_tool = tool(get_live_market_data)
-
 langchain_tools = [
     get_sales_forecast,
     search_company_knowledge,
     check_inventory_advanced,
     draft_purchase_order,
-    execute_text_to_sql_tool,
-    get_live_market_data_tool
+    execute_text_to_sql,
+    get_live_market_data,
+    lookup_stakeholders,
+    check_recent_anomalies
 ]
 
-@app.post("/dashboard/summary")
+@app.post("/dashboard/summary", dependencies=[Depends(verify_api_key)])
 def get_dashboard_summary(req: PredictionRequest):
     # We use PredictionRequest since it already has store_id and family
     m, metrics, exists = load_model(req.store_id, req.family)
@@ -743,7 +1001,7 @@ def get_dashboard_summary(req: PredictionRequest):
         ]
     }
 
-@app.get("/available_categories")
+@app.get("/available_categories", dependencies=[Depends(verify_api_key)])
 def get_available_categories(store_id: int = 1):
     """Scans the model_registry folder and returns a list of trained categories."""
     
@@ -760,50 +1018,114 @@ def get_available_categories(store_id: int = 1):
             
     return {"categories": sorted(list(categories)) or ["GROCERY I"]}
 
-@app.post("/chat")
-def chat_with_multi_agent_system(req: ChatRequest):
+@app.get("/orders", dependencies=[Depends(verify_api_key)])
+def get_orders(store_id: int = Query(1, gt=0), user_id: str = Depends(verify_api_key)):
+    """
+    Returns all purchase orders for the given store from the purchase_orders table.
+    Used by the Orders & Procurement Hub page.
+    """
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS purchase_orders (
+                    id              SERIAL PRIMARY KEY,
+                    tenant_id       VARCHAR(50),
+                    family          VARCHAR(255),
+                    quantity        INTEGER,
+                    estimated_cost  FLOAT,
+                    status          VARCHAR(50),
+                    created_at      TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.commit()
+
+            rows = conn.execute(text("""
+                SELECT id, family, quantity, estimated_cost, status, created_at
+                FROM   purchase_orders
+                WHERE  tenant_id = :uid
+                ORDER  BY created_at DESC
+                LIMIT  200
+            """), {"uid": user_id}).fetchall()
+
+            orders = [
+                {
+                    "id":             row[0],
+                    "family":         row[1],
+                    "quantity":       row[2],
+                    "estimated_cost": round(row[3], 2) if row[3] else 0,
+                    "status":         (row[4] or "approved").lower(),
+                    "created_at":     row[5].isoformat() if row[5] else None,
+                    "supplier":       None,
+                }
+                for row in rows
+            ]
+            return {"orders": orders, "total": len(orders)}
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"DB error: {str(e)}")
+
+
+@app.post("/chat", dependencies=[Depends(verify_api_key)])
+@limiter.limit("20/minute")
+def chat_with_multi_agent_system(req: ChatRequest, request: Request, user_id: str = Depends(verify_api_key)):
     """
     Overhauled Chat Endpoint using LangChain and Llama3.1.
     """
     
     # 1. Initialize the LLM
+    _current_tenant_id.set(user_id)
     try:
-        def log_rate_limits(response):
-            rem = response.headers.get("x-ratelimit-remaining")
-            reset = response.headers.get("x-ratelimit-reset")
-            if rem is not None:
-                print(f"📊 Rate Limits -> x-ratelimit-remaining: {rem} | x-ratelimit-reset: {reset}")
-
-        http_client = httpx.Client(event_hooks={'response': [log_rate_limits]})
-
-        # Using GitHub Models API
-        llm = ChatOpenAI(
-            model="gpt-4o-mini", 
-            temperature=0,
-            api_key=os.environ.get("GITHUB_TOKEN"),
-            base_url="https://models.inference.ai.azure.com",
-            http_client=http_client
-        )
+        llm = get_llm()
     except Exception as e:
         return {"type": "message", "content": f"Failed to connect to API: {str(e)}"}
 
     # 2. Build the System Prompt
     system_content = (
-        "You are a highly capable AI Supply Chain Executive combining mathematical forecasting with business intelligence.\n\n"
-        "CORE RULES:\n"
-        "1. You have tools to check mathematical forecasts, search internal emails, check inventory, and draft orders.\n"
-        "2. USE YOUR TOOLS. If someone asks about 'Beverages', you MUST use `get_sales_forecast` AND `search_company_knowledge` to get both the math and the human context before answering.\n"
-        "3. If the user asks you to order or restock, check inventory first using `check_inventory_advanced`, then use `draft_purchase_order` with the suggested quantity.\n"
-        "4. Provide concise, executive-level summaries combining the data sources in natural language.\n"
-        "5. CRITICAL: NEVER output raw JSON tool calls or parameters in your final response to the user. Always summarize the actions you took naturally (e.g., 'I checked the inventory and drafted an order').\n\n"
-        f"Note: The active parameters are Store {req.store_id}, Family '{req.family}', and current physical stock is {req.current_stock}."
+        "You are an AI Supply Chain Exec. Be concise.\n\n"
+        "RULES:\n"
+        "1. USE TOOLS to get data (forecasts, inventory, SQL) before answering.\n"
+        "2. To restock, use check_inventory_advanced then draft_purchase_order.\n"
+        "3. NEVER output raw JSON tool calls to the user. Speak naturally.\n\n"
+        "EXAMPLES:\n"
+        "User: Restock beverages\n"
+        "AI: [Calls tools...]\n"
+        "AI: I checked inventory and drafted an order for Beverages.\n\n"
+        f"Active Context: Store {req.store_id}, Family '{req.family}', Stock {req.current_stock}."
     )
 
-    messages = []
-    for msg in req.history[-4:]:
-        role = "assistant" if msg.get("sender") == "assistant" else "user"
-        messages.append((role, msg.get("content", "")))
-    messages.append(("user", req.message))
+    # Database-backed conversation memory
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("""
+                CREATE TABLE IF NOT EXISTS chat_history (
+                    id SERIAL PRIMARY KEY,
+                    session_id VARCHAR(50),
+                    role VARCHAR(20),
+                    content TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """))
+            conn.commit()
+
+            # Save user message
+            conn.execute(text("INSERT INTO chat_history (session_id, role, content) VALUES (:s, :r, :c)"),
+                         {"s": req.session_id, "r": "user", "c": req.message})
+            conn.commit()
+
+            # Fetch last 10 messages from DB
+            res = conn.execute(text("SELECT role, content FROM chat_history WHERE session_id = :s ORDER BY id DESC LIMIT 10"), {"s": req.session_id})
+            db_history = res.fetchall()
+            db_history.reverse()
+
+        messages = [(row[0], row[1]) for row in db_history]
+    except Exception as e:
+        print(f"Database memory error: {e}")
+        # Fallback to stateless req.history if DB fails
+        messages = []
+        for msg in req.history[-4:]:
+            role = "assistant" if msg.get("sender") == "assistant" else "user"
+            messages.append((role, msg.get("content", "")))
+        messages.append(("user", req.message))
 
     # 3. Create the LangGraph Agent
     agent_executor = create_react_agent(llm, tools=langchain_tools, prompt=system_content)
@@ -844,46 +1166,35 @@ def chat_with_multi_agent_system(req: ChatRequest):
                     except Exception as e:
                         pass
 
-        # Fallback: LLaMA 3.1 sometimes fails native tool invocation and outputs JSON as text.
-        if '"name": "draft_purchase_order"' in raw_output:
-            try:
-                match = re.search(r'\{"name": "draft_purchase_order", "parameters": (\{.*?\})\}', raw_output)
-                if match:
-                    params = json.loads(match.group(1))
-                    fam = params.get("family", req.family)
-                    qty = params.get("quantity", 100)
-                    
-                    widget_json_str = draft_purchase_order.invoke({"family": fam, "quantity": qty})
-                    
-                    # Instead of injecting into raw_output, just parse it
-                    parsed_widget = json.loads(widget_json_str)
-                    if parsed_widget.get("WIDGET_TRIGGER") == "purchase_order":
-                        final_type = "purchase_order"
-                        widget_data = parsed_widget
-                    
-                    raw_output = re.sub(r'To answer.*?function call: \{.*?\}', '', raw_output, flags=re.IGNORECASE|re.DOTALL)
-                    raw_output = re.sub(r'\{"name": "draft_purchase_order".*?\}', '', raw_output)
-            except Exception as e:
-                print(f"Fallback parse failed: {e}")
-
-        # Just in case `WIDGET_TRIGGER` is still in the text for some reason
+        # Fallback: using JsonOutputParser
         if "WIDGET_TRIGGER" in raw_output:
             try:
-                match = re.search(r'\{.*?"WIDGET_TRIGGER".*?\}', raw_output, re.DOTALL)
-                if match:
-                    parsed_widget = json.loads(match.group(0))
+                start = raw_output.find('{')
+                end = raw_output.rfind('}') + 1
+                if start >= 0 and end > start:
+                    parser = JsonOutputParser()
+                    parsed_widget = parser.invoke(raw_output[start:end])
                     if parsed_widget.get("WIDGET_TRIGGER") == "purchase_order":
                         final_type = "purchase_order"
                         widget_data = parsed_widget
-                    raw_output = raw_output.replace(match.group(0), "").strip()
+                        raw_output = raw_output.replace(raw_output[start:end], "").strip()
             except Exception as e:
-                pass
+                print(f"Fallback parse failed: {e}")
 
         if not agent_thoughts:
             agent_thoughts.append({
                 "tool": "ReAct Langchain Executor",
                 "args": {"tasks": "Reasoning complete"}
             })
+
+        # Save assistant message
+        try:
+            with engine.connect() as conn:
+                conn.execute(text("INSERT INTO chat_history (session_id, role, content) VALUES (:s, :r, :c)"),
+                             {"s": req.session_id, "r": "assistant", "c": raw_output.strip()})
+                conn.commit()
+        except Exception as e:
+            print(f"Failed to save assistant memory: {e}")
 
         return {
             "type": final_type,
@@ -901,7 +1212,7 @@ def chat_with_multi_agent_system(req: ChatRequest):
         }
 
 @app.post("/submit_order")
-def submit_order(req: OrderSubmitRequest):
+def submit_order(req: OrderSubmitRequest, user_id: str = Depends(verify_api_key)):
     if req.action == "approve":
         estimated_cost = req.quantity * 15.5
         try:
@@ -909,6 +1220,7 @@ def submit_order(req: OrderSubmitRequest):
                 connection.execute(text("""
                     CREATE TABLE IF NOT EXISTS purchase_orders (
                         id SERIAL PRIMARY KEY,
+                        tenant_id VARCHAR(50),
                         family VARCHAR(255),
                         quantity INTEGER,
                         estimated_cost FLOAT,
@@ -917,18 +1229,23 @@ def submit_order(req: OrderSubmitRequest):
                     )
                 """))
                 connection.execute(text("""
-                    INSERT INTO purchase_orders (family, quantity, estimated_cost, status)
-                    VALUES (:family, :quantity, :cost, 'APPROVED')
-                """), {"family": req.family.upper(), "quantity": req.quantity, "cost": estimated_cost})
+                    INSERT INTO purchase_orders (tenant_id, family, quantity, estimated_cost, status)
+                    VALUES (:t_id, :family, :quantity, :cost, 'APPROVED')
+                """), {
+                    "t_id": user_id, 
+                    "family": req.family.upper(), 
+                    "quantity": req.quantity, 
+                    "cost": estimated_cost
+                })
                 connection.commit()
-                print(f"✅ SUCCESS: Ordered {req.quantity} of {req.family} to DB")
+                print(f"✅ SUCCESS: Ordered {req.quantity} of {req.family} to DB under tenant {user_id}")
                 return {"status": "success", "message": f"Order for {req.quantity} units placed!"}
         except Exception as e:
             print(f"⚠️ Failed to save PO to db: {e}")
             raise HTTPException(status_code=500, detail="DB Error")
             
     elif req.action == "reject":
-        print(f"❌ REJECTED: Cancelled order for {req.family}")
+        print(f"❌ REJECTED: Cancelled order for {req.family} by tenant {user_id}")
         return {"status": "cancelled", "message": "Order was rejected."}
         
     return {"status": "error", "message": "Invalid action."}

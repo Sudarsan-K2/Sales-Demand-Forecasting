@@ -85,10 +85,11 @@ def train_and_save_model(store_id, family):
     # Metrics Calculation
     metrics = {}
     
-    # A. MAPE (Percentage Error)
-    if len(y_true_clean) > 0:
-        mape = np.mean(np.abs((y_true_clean - y_pred_clean) / y_true_clean)) * 100
-        metrics['mape'] = round(mape, 2)
+    # A. wMAPE (Volume-Weighted MAPE)
+    total_actuals = np.sum(np.abs(y_true))
+    if total_actuals > 0:
+        mape = (np.sum(np.abs(y_true - y_pred)) / total_actuals) * 100
+        metrics['mape'] = round(float(mape), 2)
     else:
         metrics['mape'] = 0.0
         
