@@ -1,0 +1,77 @@
+# ========== Python ==========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.pytest_cache/
+.mypy_cache/
+.dmypy.json
+dmypy.json
+*.pyo
+
+# Virtual Environments
+.venv/
+venv/
+env/
+ENV/
+
+# ========== Environment & Secrets ==========
+.env
+.env.*
+*.env
+!.env.example
+
+# ========== Logs & Debug ==========
+*.log
+err.log
+logs/
+
+# ========== Data Files (large) ==========
+train.csv
+*.db
+*.sqlite3
+
+# ========== ML / AI ==========
+model_registry/
+chroma_db/
+*.pkl
+*.joblib
+*.h5
+*.pt
+*.pth
+*.onnx
+
+# ========== IDE ==========
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+
+# ========== Pyre (type checker) ==========
+.pyre/
+.pyre_configuration
+
+# ========== Node / React (sales-dashboard) ==========
+sales-dashboard/node_modules/
+sales-dashboard/build/
+sales-dashboard/.env
+sales-dashboard/.env.local
+sales-dashboard/.env.development.local
+sales-dashboard/.env.test.local
+sales-dashboard/.env.production.local
+sales-dashboard/npm-debug.log*
+sales-dashboard/yarn-debug.log*
+sales-dashboard/yarn-error.log*
+
+# ========== Misc ==========
+pip_list.txt
+*.tmp
+*.bak
+v1_archive/
