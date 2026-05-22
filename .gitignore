@@ -72,6 +72,7 @@ sales-dashboard/yarn-debug.log*
 sales-dashboard/yarn-error.log*
 
 # ========== Misc ==========
+.matplotlib/
 pip_list.txt
 *.tmp
 *.bak
