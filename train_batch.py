@@ -5,13 +5,19 @@ from sqlalchemy import create_engine
 import json
 import os
 import numpy as np
+from dotenv import load_dotenv
+load_dotenv(override=True)
 
 # --- DATABASE SETUP ---
-DB_USER = "postgres"
-DB_PASS = "ELEPHANT" 
-DB_HOST = "localhost"
-DB_NAME = "SalesForecast"
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:5432/{DB_NAME}"
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASS = os.environ.get("DB_PASS", "")
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+DB_NAME = os.environ.get("DB_NAME", "SalesForecast")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
 engine = create_engine(DATABASE_URL)
 
 os.makedirs("model_registry", exist_ok=True)

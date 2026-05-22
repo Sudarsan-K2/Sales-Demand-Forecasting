@@ -51,7 +51,7 @@ def get_llm():
     )
 
 # Initialize ChromaDB Client
-CHROMA_DB_DIR = "./chroma_db"
+CHROMA_DB_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chroma_db")
 try:
     chroma_client = chromadb.PersistentClient(path=CHROMA_DB_DIR)
     knowledge_collection = chroma_client.get_collection("supply_chain_knowledge")
@@ -71,19 +71,28 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 REGISTRY_DIR = os.path.join(BASE_DIR, "model_registry")
 
 # --- CORS SETUP ---
+# Set ALLOWED_ORIGINS in .env as a comma-separated list, e.g.:
+# ALLOWED_ORIGINS=http://localhost:3000,https://your-app.vercel.app
+_raw_origins = os.environ.get("ALLOWED_ORIGINS", "http://localhost:3000")
+ALLOWED_ORIGINS = [o.strip() for o in _raw_origins.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-DB_USER = "postgres"
-DB_PASS = "ELEPHANT" 
-DB_HOST = "localhost"
-DB_NAME = "SalesForecast"
-DATABASE_URL = f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:5432/{DB_NAME}"
+DB_USER = os.environ.get("DB_USER", "postgres")
+DB_PASS = os.environ.get("DB_PASS", "")
+DB_HOST = os.environ.get("DB_HOST", "localhost")
+DB_PORT = os.environ.get("DB_PORT", "5432")
+DB_NAME = os.environ.get("DB_NAME", "SalesForecast")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    f"postgresql://{DB_USER}:{DB_PASS}@{DB_HOST}:{DB_PORT}/{DB_NAME}"
+)
 engine = create_engine(DATABASE_URL)
 
 api_key_header = APIKeyHeader(name="X-API-Key", auto_error=False)
@@ -100,11 +109,18 @@ def verify_api_key(api_key: str = Security(api_key_header)):
                 user_id VARCHAR(50)
             )
         """))
-        try:
-            conn.execute(text("INSERT INTO api_keys (key, user_id) VALUES ('secret-token', 'admin_user') ON CONFLICT DO NOTHING"))
-            conn.commit()
-        except Exception as e:
-            print(f"Seed insert skipped: {e}")
+        # Seed a default admin key from environment variable (never hardcode this!)
+        # Set ADMIN_API_KEY in your .env file.
+        seed_key = os.environ.get("ADMIN_API_KEY")
+        if seed_key:
+            try:
+                conn.execute(
+                    text("INSERT INTO api_keys (key, user_id) VALUES (:k, 'admin_user') ON CONFLICT DO NOTHING"),
+                    {"k": seed_key}
+                )
+                conn.commit()
+            except Exception as e:
+                print(f"Seed insert skipped: {e}")
             
         res = conn.execute(text("SELECT user_id FROM api_keys WHERE key = :k"), {"k": api_key}).fetchone()
         if not res:
