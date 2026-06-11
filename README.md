@@ -1,4 +1,5 @@
-# 📈 Sales Forecasting & Inventory Decision System
+# 📈 Sales Forecasting & Inventory Decision System 
+# https://sales-demand-forecasting-sooty.vercel.app/
 
 An AI-powered sales forecasting and inventory optimization platform built with **FastAPI**, **Facebook Prophet**, and **LangGraph**. It combines time-series forecasting, natural language querying, and RAG-based supply chain intelligence into a single decision support system.
 
